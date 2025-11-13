@@ -1,0 +1,11 @@
+name,gender,is_leader,prev1,prev2,is_veteran
+정민서,F,True,,,False
+이수진,F,True,,,False
+우화영,F,True,,,False
+신희영,F,True,,,False
+김성민,M,True,,,False
+김예원,F,False,김민서;김수민,김재준,False
+문채운,F,False,김준성,문현희,True
+김민서,F,False,김예원;김수민,김시은,False
+김준성,M,False,문채운,김준호,True
+김수민,M,False,김예원;김민서,마성수,False

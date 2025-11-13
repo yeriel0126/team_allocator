@@ -1,0 +1,711 @@
+# 향연 조짜기 알고리즘 v2.0
+# 개선사항: 데이터 누적, 유연한 조 수 설정, 성비 균형 강화, 임원진 고정
+# 사용법: 파일 맨 아래에 있는 example()을 참고하거나, CSV로 명단을 만들어 run()
+# Python 3.8+
+
+from collections import defaultdict, Counter
+import random
+import csv
+import math
+import json
+import os
+from copy import deepcopy
+from datetime import datetime
+
+random.seed(0)
+
+# ------------ 데이터 저장/로드 시스템 ------------
+class DataManager:
+    def __init__(self, data_file="group_history.json"):
+        self.data_file = data_file
+        self.history = self.load_history()
+    
+    def load_history(self):
+        """히스토리 데이터를 로드합니다."""
+        if os.path.exists(self.data_file):
+            try:
+                with open(self.data_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except:
+                return {"groups": [], "people_history": {}}
+        return {"groups": [], "people_history": {}}
+    
+    def save_history(self):
+        """히스토리 데이터를 저장합니다."""
+        with open(self.data_file, 'w', encoding='utf-8') as f:
+            json.dump(self.history, f, ensure_ascii=False, indent=2)
+    
+    def add_group_result(self, groups, week_num):
+        """조 결과를 히스토리에 추가합니다."""
+        group_data = {
+            "week": week_num,
+            "timestamp": datetime.now().isoformat(),
+            "groups": []
+        }
+        
+        for group in groups:
+            group_info = {
+                "id": group['id'],
+                "leader": group['leader'].name,
+                "members": [m.name for m in group['members']]
+            }
+            group_data["groups"].append(group_info)
+        
+        self.history["groups"].append(group_data)
+        self.save_history()
+    
+    def get_previous_groups(self, person_name, weeks_back=2):
+        """특정 사람의 이전 조 정보를 가져옵니다."""
+        prev_groups = []
+        for group_data in self.history["groups"][-weeks_back:]:
+            for group in group_data["groups"]:
+                if person_name in group["members"]:
+                    prev_groups.append(group["members"])
+        return prev_groups
+
+# ------------ 유틸 / 데이터 모델 ------------
+class Person:
+    def __init__(self, name, gender=None, is_leader=False, prev_week1=None, prev_week2=None, is_veteran=False, data_manager=None):
+        self.name = name
+        self.gender = gender  # 'M' or 'F' or None
+        self.is_leader = is_leader
+        self.prev_week1 = set(prev_week1 or [])  # names they sat with week1
+        self.prev_week2 = set(prev_week2 or [])
+        self.is_veteran = is_veteran
+        self.data_manager = data_manager
+        
+        # 데이터 매니저가 있으면 히스토리에서 이전 조 정보를 자동으로 로드
+        if data_manager:
+            self.load_history_from_data_manager()
+
+    def load_history_from_data_manager(self):
+        """데이터 매니저에서 이전 조 정보를 로드합니다."""
+        if self.data_manager:
+            prev_groups = self.data_manager.get_previous_groups(self.name)
+            if len(prev_groups) >= 1:
+                self.prev_week1 = set(prev_groups[-1]) - {self.name}
+            if len(prev_groups) >= 2:
+                self.prev_week2 = set(prev_groups[-2]) - {self.name}
+
+    def __repr__(self):
+        flags = []
+        if self.is_leader: flags.append("Leader")
+        if self.is_veteran: flags.append("Vet")
+        return f"{self.name}({self.gender}){'/'.join(flags)}"
+
+# ------------ 페널티(비용) 함수 정의 ------------
+def penalty_for_placing(person: Person, group, config):
+    """
+    group: dict with keys: 'members' (list of Person)
+    config: dict of penalty weights and target gender ratio
+    """
+    p = 0.0
+    members = group['members']
+    names = {m.name for m in members}
+
+    # 하드 제약: 1주차(가장 오래된 주차) 같은 조였던 사람과는 절대 같은 조 불가
+    # DataManager 로드 순서상 prev_week2가 1주차, prev_week1이 2주차를 의미
+    common_week1 = names & person.prev_week2
+    if common_week1:
+        return 1e9
+
+    # 1) 최근 주차(2주차) 같은 조 회피(강한 페널티)
+    common_recent = names & person.prev_week1
+    if common_recent:
+        p += config['w_week1'] * len(common_recent)
+    
+    # 3) 추가 페널티: 같은 사람과 반복적으로 만나는 것 방지
+    # 전체 히스토리에서 만난 사람들과의 겹침에 대한 페널티
+    if person.data_manager:
+        all_previous_partners = set()
+        for group_data in person.data_manager.history["groups"]:
+            for group in group_data["groups"]:
+                if person.name in group["members"]:
+                    all_previous_partners.update(group["members"])
+        
+        # 자기 자신 제외
+        all_previous_partners.discard(person.name)
+        
+        # 현재 그룹과 이전에 만난 사람들의 겹침
+        overlap_with_history = names & all_previous_partners
+        if overlap_with_history:
+            p += config.get('w_history_overlap', 15.0) * len(overlap_with_history)
+
+    # 4) 연임자(특히 피함): 그룹 내 다른 연임자가 있으면 큰 페널티
+    if person.is_veteran:
+        vet_count = sum(1 for m in members if m.is_veteran)
+        # if vet_count>0 then adding this person increases vet pairing
+        p += config['w_vet'] * vet_count
+
+    # 5) 성비 페널티: 현재 그룹 성비에서 벗어나는 정도 (개선된 알고리즘)
+    if person.gender in ('M', 'F'):
+        # compute gender counts after adding this person
+        cnt = Counter(m.gender for m in members if m.gender in ('M','F'))
+        cnt[person.gender] += 1
+        target_ratio = config.get('target_female_ratio', 0.5)
+        
+        total_known = cnt['M'] + cnt['F']
+        if total_known > 0:
+            female_ratio = cnt['F'] / total_known
+            # 성비 불균형에 대한 더 강한 페널티
+            ratio_deviation = abs(female_ratio - target_ratio)
+            # 그룹 크기가 클수록 성비 불균형에 대한 페널티를 증가
+            group_size_factor = len(members) + 1
+            p += config['w_gender'] * ratio_deviation * group_size_factor * 10
+            
+            # 극단적인 성비 불균형에 대한 추가 페널티
+            if female_ratio < 0.2 or female_ratio > 0.8:
+                p += config.get('w_extreme_gender', 20.0)
+    else:
+        # unknown gender: small uncertainty penalty
+        p += config.get('w_unknown_gender', 0.1)
+
+    # 6) size overflow: infinite cost if group full
+    capacity = group.get('capacity', 10)  # 기본값 10
+    if len(members) >= capacity:
+        p += 1e6
+
+    return p
+
+# ------------ 핵심 알고리즘 ------------
+def make_groups(people, leaders, num_groups=None, group_capacity=None, config=None, max_iters=2000, data_manager=None):
+    """
+    people: list of Person (including leaders)
+    leaders: list of leader names (must be subset of people)
+    num_groups: int (None이면 자동 계산)
+    group_capacity: int (None이면 자동 계산)
+    config: penalty weights
+    data_manager: DataManager 인스턴스
+    Returns: list of groups (dicts with 'leader' and 'members')
+    """
+    
+    # 기본 설정값
+    if config is None:
+        config = {
+            'w_week1': 50.0,   # 매우 강한 페널티로 1주차 같은 조 회피
+            'w_week2': 8.0,    # 2주차에 대한 작은 페널티
+            'w_history_overlap': 15.0,  # 전체 히스토리 겹침 방지
+            'w_vet': 30.0,     # 연임자들이 함께되는 것을 피하기 위한 강한 페널티
+            'w_gender': 6.0,   # 성비 균형 페널티 가중치
+            'target_female_ratio': 0.5,
+            'w_unknown_gender': 0.2,
+            'w_extreme_gender': 20.0
+        }
+    
+    # 자동으로 조 수와 조 크기 계산
+    if num_groups is None or group_capacity is None:
+        total_people = len(people)
+        # 5조 또는 6조 중 더 균형잡힌 것을 선택
+        if num_groups is None:
+            candidates = [5, 6]
+            best_groups = 5
+            min_waste = float('inf')
+            for ng in candidates:
+                waste = total_people % ng
+                if waste < min_waste:
+                    min_waste = waste
+                    best_groups = ng
+            num_groups = best_groups
+        
+        if group_capacity is None:
+            group_capacity = math.ceil(total_people / num_groups)
+    
+    # 선제 중복 제거: 이름 기준으로 unique 처리 (가장 처음 등장만 유지)
+    unique_people = []
+    seen_names_initial = set()
+    for p in people:
+        if p.name not in seen_names_initial:
+            unique_people.append(p)
+            seen_names_initial.add(p.name)
+    people = unique_people
+
+    name_to_person = {p.name: p for p in people}
+
+    # 임원진 고정 배치: 각 조에 임원진을 먼저 배치
+    groups = []
+    leader_list = [name_to_person[n] for n in leaders if n in name_to_person]
+    
+    # 임원진이 조 수보다 적으면 일부 조에 임원진 없이 시작
+    if len(leader_list) < num_groups:
+        # 임원진을 가능한 한 균등하게 분산
+        for i in range(num_groups):
+            leader = leader_list[i % len(leader_list)] if leader_list else None
+            groups.append({'leader': leader, 'members': [leader] if leader else [], 'capacity': group_capacity, 'id': i+1})
+    else:
+        # 임원진이 충분하면 각 조에 임원진 배치
+        leader_list = leader_list[:num_groups]  # 조 수만큼만 사용
+        for i in range(num_groups):
+            leader = leader_list[i]
+            groups.append({'leader': leader, 'members': [leader], 'capacity': group_capacity, 'id': i+1})
+
+    # remaining people
+    assigned_names = set()
+    for g in groups:
+        for m in g['members']:
+            assigned_names.add(m.name)
+    
+    remaining = [p for p in people if p.name not in assigned_names]
+    
+    # (이후 단계에선 사후 sanitize로도 한 번 더 안전장치 적용)
+
+    # sort remaining by "constrainedness" (veterans and people who sat with many others)
+    def constrained_score(p):
+        return (10 if p.is_veteran else 0) + len(p.prev_week1)*5 + len(p.prev_week2)*2
+    remaining.sort(key=constrained_score, reverse=True)
+
+    # Greedy assignment: assign each person to group with minimal penalty
+    # 전역 중복 방지: 모든 그룹에서 이미 할당된 이름 추적
+    all_assigned_names = set()
+    for g in groups:
+        for m in g['members']:
+            all_assigned_names.add(m.name)
+    
+    for p in remaining:
+        # 이미 다른 그룹에 할당됐으면 스킵
+        if p.name in all_assigned_names:
+            print(f"경고: {p.name}이 이미 다른 조에 할당되어 있습니다. 스킵합니다.")
+            continue
+            
+        best_group = None
+        best_pen = float('inf')
+        # shuffle group order slightly to avoid deterministic ties
+        order = list(range(len(groups)))
+        random.shuffle(order)
+        for j in order:
+            g = groups[j]
+            # 현재 그룹에도 이미 같은 이름이 있으면 스킵
+            if any(m.name == p.name for m in g['members']):
+                continue
+            pen = penalty_for_placing(p, g, config)
+            if pen < best_pen:
+                best_pen = pen
+                best_group = g
+        if best_group:
+            best_group['members'].append(p)
+            all_assigned_names.add(p.name)
+        else:
+            print(f"경고: {p.name}을 배치할 적절한 조를 찾지 못했습니다.")
+
+    # Local improvement: try swaps that reduce total penalty
+    def total_penalty(groups):
+        tot = 0.0
+        for g in groups:
+            for m in g['members']:
+                tot += penalty_for_placing(m, g, config)
+        return tot
+
+    def count_overlaps(groups):
+        """조 간의 중복을 계산합니다."""
+        overlaps = 0
+        for i in range(len(groups)):
+            for j in range(i+1, len(groups)):
+                names_i = {m.name for m in groups[i]['members']}
+                names_j = {m.name for m in groups[j]['members']}
+                overlaps += len(names_i & names_j)
+        return overlaps
+
+    current_pen = total_penalty(groups)
+    improved = True
+    it = 0
+    
+    print(f"초기 중복 수: {count_overlaps(groups)}")
+    
+    while improved and it < max_iters:
+        it += 1
+        improved = False
+        # try pairwise swaps between groups (excluding leaders)
+        for i in range(len(groups)):
+            for j in range(i+1, len(groups)):
+                gi = groups[i]; gj = groups[j]
+                # try all member pairs (skip leader swapping)
+                for a_idx, a in enumerate(gi['members']):
+                    for b_idx, b in enumerate(gj['members']):
+                        if a.is_leader or b.is_leader:
+                            continue
+                        # 중복 체크: swap 후 같은 이름이 두 그룹에 있으면 안됨
+                        if a.name == b.name:
+                            continue
+                        # gi에 b와 같은 이름이 있으면 skip
+                        if any(m.name == b.name for m in gi['members']):
+                            continue
+                        # gj에 a와 같은 이름이 있으면 skip
+                        if any(m.name == a.name for m in gj['members']):
+                            continue
+                        # try swap a<->b
+                        # compute delta penalty quickly by evaluating contributions of a and b only
+                        before = penalty_for_placing(a, gi, config) + penalty_for_placing(b, gj, config)
+                        # simulate swap
+                        gi['members'][a_idx] = b
+                        gj['members'][b_idx] = a
+                        after = penalty_for_placing(b, gi, config) + penalty_for_placing(a, gj, config)
+                        if after < before - 1e-6:
+                            current_pen += (after - before)
+                            improved = True
+                            # keep swap
+                        else:
+                            # revert
+                            gi['members'][a_idx] = a
+                            gj['members'][b_idx] = b
+                if improved:
+                    break
+            if improved:
+                break
+    
+    print(f"최적화 후 중복 수: {count_overlaps(groups)}")
+    print(f"최적화 반복 횟수: {it}")
+
+    # 사후 정리: 전역 중복 및 누락 해결
+    def sanitize_and_reassign(groups):
+        # 1단계: 각 그룹 내 중복 제거 (첫 등장만 유지)
+        for g in groups:
+            seen_local = set()
+            unique_members = []
+            for m in g['members']:
+                if m.name in seen_local:
+                    print(f"경고: {m.name}이 조 {g['id']} 내에서 중복됨 - 제거")
+                    continue
+                seen_local.add(m.name)
+                unique_members.append(m)
+            g['members'] = unique_members
+
+        # 2단계: 전역 중복 체크 및 수정
+        # 모든 그룹을 순회하며 각 이름이 처음 나타나는 그룹에만 남기고 나머지는 제거
+        name_to_first_group = {}
+        for g in groups:
+            for m in g['members']:
+                if m.name in name_to_first_group:
+                    # 이미 다른 그룹에 있음 - 현재 그룹에서는 제거
+                    continue
+                name_to_first_group[m.name] = g
+
+        # 각 그룹에서 고유한 멤버만 유지
+        to_reassign = []
+        for g in groups:
+            unique_members = []
+            for m in g['members']:
+                if name_to_first_group.get(m.name) is g:
+                    unique_members.append(m)
+                else:
+                    # 다른 그룹에도 있는 경우 → 재배치 대상
+                    to_reassign.append(m)
+            g['members'] = unique_members
+
+        # 3단계: 제거된 인원 재배치
+        reassigned_count = 0
+        for p in to_reassign:
+            best_group = None
+            best_pen = float('inf')
+            for g in groups:
+                # 수용 가능 여부 및 동일 이름 없는지 확인
+                if len(g['members']) >= g.get('capacity', 10):
+                    continue
+                if any(m.name == p.name for m in g['members']):
+                    continue
+                pen = penalty_for_placing(p, g, config)
+                if pen < best_pen:
+                    best_pen = pen
+                    best_group = g
+            if best_group is not None:
+                best_group['members'].append(p)
+                reassigned_count += 1
+            else:
+                print(f"경고: {p.name}을 재배치할 그룹을 찾지 못함")
+
+        if reassigned_count > 0:
+            print(f"중복 인원 {reassigned_count}명 재배치 완료")
+
+    sanitize_and_reassign(groups)
+
+    # 인원 균형화: 조별 인원이 최대 1명 차이 이내가 되도록 재분배
+    def rebalance_group_sizes(groups):
+        total_people = sum(len(g['members']) for g in groups)
+        gcount = len(groups)
+        base = total_people // gcount
+        extra = total_people % gcount
+        # 이상적인 크기: 앞쪽 extra개 조는 base+1, 나머지는 base
+        ideal_sizes = {}
+        for idx, g in enumerate(groups):
+            ideal_sizes[g['id']] = base + 1 if idx < extra else base
+
+        # undersized와 oversized 목록 계산
+        def collect():
+            unders = []
+            overs = []
+            for g in groups:
+                sz = len(g['members'])
+                ideal = ideal_sizes[g['id']]
+                if sz < ideal:
+                    unders.append((g, ideal - sz))
+                elif sz > ideal:
+                    overs.append((g, sz - ideal))
+            return unders, overs
+
+        changed = True
+        while changed:
+            changed = False
+            unders, overs = collect()
+            if not unders or not overs:
+                break
+            # 각 부족 그룹에 대해, 여유가 있는 그룹에서 최적의 한 명을 이동
+            for ug, need in unders:
+                if need <= 0:
+                    continue
+                best_choice = None
+                best_delta = float('inf')
+                best_from = None
+                for og, extra_cnt in overs:
+                    if extra_cnt <= 0:
+                        continue
+                    # 리더는 이동하지 않음
+                    for idx_m, m in enumerate(og['members']):
+                        if m.is_leader:
+                            continue
+                        # 대상 그룹에 동일 인원이 이미 있으면 스킵
+                        if any(x.name == m.name for x in ug['members']):
+                            continue
+                        # 이동 전/후 비용 근사 비교
+                        before = penalty_for_placing(m, og, config)
+                        after = penalty_for_placing(m, ug, config)
+                        delta = after - before
+                        if delta < best_delta:
+                            best_delta = delta
+                            best_choice = (og, idx_m, m)
+                            best_from = og
+                if best_choice is not None:
+                    og, idx_m, m = best_choice
+                    # 실제 이동
+                    del og['members'][idx_m]
+                    ug['members'].append(m)
+                    changed = True
+        # 끝
+
+    rebalance_group_sizes(groups)
+
+    # 데이터 매니저가 있으면 결과를 저장
+    if data_manager:
+        week_num = len(data_manager.history["groups"]) + 1
+        data_manager.add_group_result(groups, week_num)
+    
+    return groups, current_pen
+
+# ------------ CSV 읽기 / 예시 포맷 ------------
+def load_people_from_csv(path, data_manager=None):
+    # CSV columns: name,gender,is_leader,prev1_semicolon_separated,prev2_semicolon_separated,is_veteran
+    people = []
+    with open(path, newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            name = row['name'].strip()
+            gender = row.get('gender','').strip() or None
+            is_leader = row.get('is_leader','').strip().lower() in ('1','true','yes','y')
+            prev1 = [s.strip() for s in (row.get('prev1','') or '').split(';') if s.strip()]
+            prev2 = [s.strip() for s in (row.get('prev2','') or '').split(';') if s.strip()]
+            is_vet = row.get('is_veteran','').strip().lower() in ('1','true','yes','y')
+            people.append(Person(name, gender, is_leader, prev1, prev2, is_vet, data_manager))
+    
+    # 중복 제거 (이름 기준)
+    unique_people = []
+    seen_names = set()
+    for person in people:
+        if person.name not in seen_names:
+            unique_people.append(person)
+            seen_names.add(person.name)
+    
+    return unique_people
+
+# ------------ 사용자 친화적 인터페이스 ------------
+def create_groups_from_csv(csv_path, leaders=None, num_groups=None, group_capacity=None, config=None):
+    """
+    CSV 파일에서 데이터를 읽어 조를 만드는 메인 함수
+    
+    Args:
+        csv_path: CSV 파일 경로
+        leaders: 임원진 이름 리스트 (None이면 CSV에서 is_leader=True인 사람들 사용)
+        num_groups: 조 수 (None이면 자동 계산)
+        group_capacity: 조당 인원수 (None이면 자동 계산)
+        config: 페널티 설정 (None이면 기본값 사용)
+    
+    Returns:
+        groups: 조 결과 리스트
+        penalty: 총 페널티 점수
+    """
+    data_manager = DataManager()
+    
+    # CSV에서 사람들 로드
+    people = load_people_from_csv(csv_path, data_manager)
+    
+    # 임원진 자동 감지
+    if leaders is None:
+        leaders = [p.name for p in people if p.is_leader]
+    
+    print(f"총 {len(people)}명의 사람을 로드했습니다.")
+    print(f"임원진: {leaders}")
+    
+    # 조 생성
+    groups, penalty = make_groups(
+        people=people,
+        leaders=leaders,
+        num_groups=num_groups,
+        group_capacity=group_capacity,
+        config=config,
+        data_manager=data_manager
+    )
+    
+    return groups, penalty, data_manager
+
+def print_groups(groups, show_details=True):
+    """조 결과를 보기 좋게 출력합니다."""
+    print(f"\n=== 조 구성 결과 ===")
+    
+    # 기본 config로 페널티 계산
+    default_config = {
+        'w_week1': 50.0, 'w_week2': 8.0, 'w_history_overlap': 15.0, 'w_vet': 30.0, 'w_gender': 6.0,
+        'target_female_ratio': 0.5, 'w_unknown_gender': 0.2, 'w_extreme_gender': 20.0
+    }
+    total_penalty = sum(penalty_for_placing(m, g, default_config) for g in groups for m in g['members'])
+    print(f"총 페널티: {total_penalty:.2f}")
+    
+    for g in groups:
+        print(f"\n📋 조 {g['id']} - 조장: {g['leader'].name if g['leader'] else '없음'}")
+        print(f"   인원: {len(g['members'])}명")
+        
+        if show_details:
+            print("   구성원:")
+            for m in g['members']:
+                print(f"     • {m}")
+            
+            # 성비 정보
+            cnt = Counter(m.gender for m in g['members'] if m.gender)
+            if cnt:
+                total_known = cnt['M'] + cnt['F']
+                female_ratio = cnt['F'] / total_known if total_known > 0 else 0
+                print(f"   성비: 남성 {cnt['M']}명, 여성 {cnt['F']}명 (여성 비율: {female_ratio:.1%})")
+            else:
+                print("   성비: 정보 없음")
+
+# ------------ 예시 및 실행 ------------
+def example():
+    """예시 실행 함수 - 향연 34기 데이터 기반"""
+    print("=== 향연 34기 조짜기 알고리즘 v2.0 ===\n")
+    
+    # 향연 34기 임원진 (고정)
+    leaders = ['정민서','이수진','우화영','신희영','김성민']
+    
+    # 향연 34기 전체 명단
+    raw_names = [
+        '김예원','문채운','김민서','김준성','김수민','김종윤',
+        '김재준','문현희','김시은','김준호','마성수','노주영',
+        '유한웅','문형준','김채원','주아진','박서연','홍승아',
+        '정세이','박성원','이원섭','최선영','이성환','윤샛별',
+        '최유정','염규민','홍한비','최형우','최주현','최동호'
+    ]
+    
+    # 데이터 매니저 초기화
+    data_manager = DataManager()
+    
+    # Person 객체 생성 (실제 사용시에는 CSV에서 로드)
+    people = []
+    all_names = leaders + raw_names
+    
+    # 중복 제거를 위해 set 사용
+    unique_names = list(set(all_names))
+    
+    # 실제 성별 정보 (향연 34기 데이터)
+    gender_map = {
+        '김민서': 'M', '김수민': 'F', '김시은': 'F', '김예원': 'F', '김재준': 'M',
+        '김종윤': 'M', '노주영': 'F', '문현희': 'F', '문형준': 'M', '박서연': 'F',
+        '박성원': 'F', '염규민': 'M', '유한웅': 'M', '윤샛별': 'F', '이성환': 'M',
+        '이원섭': 'M', '정세이': 'F', '주아진': 'F', '최동호': 'M', '최선영': 'F',
+        '최주현': 'F', '최형우': 'M', '홍승아': 'F', '홍한비': 'F',
+        # 임원진 성별 정보 (추정)
+        '정민서': 'F', '이수진': 'F', '우화영': 'F', '신희영': 'F', '김성민': 'M'
+    }
+    
+    # 누락된 이름에 대해서는 랜덤 할당
+    for n in unique_names:
+        if n not in gender_map:
+            gender_map[n] = random.choice(['M','F'])
+    
+    for n in unique_names:
+        # 성별 정보 (실제 데이터로 교체 필요)
+        gender = gender_map[n]
+        is_leader = n in leaders
+        is_vet = n in ('김준성','김준호','마성수','김채원','문채운','최유정')
+        
+        # 이전 주차 조 정보 (실제 데이터로 교체 필요)
+        # 자기 자신을 제외한 다른 사람들 중에서 선택
+        other_names = [name for name in unique_names if name != n]
+        prev1 = random.sample(other_names, k=min(random.randint(0,3), len(other_names))) if not is_leader else []
+        prev2 = random.sample(other_names, k=min(random.randint(0,2), len(other_names))) if not is_leader else []
+        
+        people.append(Person(n, gender, is_leader, prev1, prev2, is_vet, data_manager))
+
+    # 개선된 설정값
+    config = {
+        'w_week1': 50.0,   # 1주차 같은 조 회피 (최우선)
+        'w_week2': 8.0,    # 2주차 같은 조 회피
+        'w_history_overlap': 15.0,  # 전체 히스토리 겹침 방지
+        'w_vet': 30.0,     # 연임자 분산
+        'w_gender': 6.0,   # 성비 균형
+        'target_female_ratio': 0.5,
+        'w_unknown_gender': 0.2,
+        'w_extreme_gender': 20.0  # 극단적 성비 불균형 방지
+    }
+
+    print(f"총 {len(people)}명으로 조를 구성합니다.")
+    print(f"임원진: {leaders}")
+    print(f"자동으로 조 수와 조 크기를 계산합니다.\n")
+
+    # 조 생성 (자동 계산 모드)
+    groups, penalty = make_groups(
+        people=people, 
+        leaders=leaders, 
+        num_groups=None,  # 자동 계산
+        group_capacity=None,  # 자동 계산
+        config=config,
+        data_manager=data_manager
+    )
+    
+    # 결과 출력
+    print_groups(groups, show_details=True)
+    
+    print(f"\n=== 사용법 안내 ===")
+    print("1. CSV 파일로 실제 데이터를 입력하려면:")
+    print("   groups, penalty, dm = create_groups_from_csv('members.csv')")
+    print("2. 조 수를 직접 지정하려면:")
+    print("   groups, penalty, dm = create_groups_from_csv('members.csv', num_groups=6)")
+    print("3. 히스토리는 'group_history.json' 파일에 자동 저장됩니다.")
+
+def create_sample_csv():
+    """샘플 CSV 파일을 생성합니다."""
+    sample_data = [
+        ['name', 'gender', 'is_leader', 'prev1', 'prev2', 'is_veteran'],
+        ['정민서', 'F', 'True', '', '', 'False'],
+        ['이수진', 'F', 'True', '', '', 'False'],
+        ['우화영', 'F', 'True', '', '', 'False'],
+        ['신희영', 'F', 'True', '', '', 'False'],
+        ['김성민', 'M', 'True', '', '', 'False'],
+        ['김예원', 'F', 'False', '김민서;김수민', '김재준', 'False'],
+        ['문채운', 'F', 'False', '김준성', '문현희', 'True'],
+        ['김민서', 'F', 'False', '김예원;김수민', '김시은', 'False'],
+        ['김준성', 'M', 'False', '문채운', '김준호', 'True'],
+        ['김수민', 'M', 'False', '김예원;김민서', '마성수', 'False'],
+    ]
+    
+    with open('sample_members.csv', 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerows(sample_data)
+    
+    print("샘플 CSV 파일 'sample_members.csv'가 생성되었습니다.")
+
+if __name__ == '__main__':
+    # 예시 실행 (CSV 파일이 없을 때만)
+    if not os.path.exists('hyangyeon_34.csv'):
+        example()
+        # 샘플 CSV 생성
+        print("\n" + "="*50)
+        create_sample_csv()
+    else:
+        print("실제 데이터 파일이 발견되었습니다. CSV 파일을 사용합니다.")
+        groups, penalty, dm = create_groups_from_csv('hyangyeon_34.csv')
+        print_groups(groups, show_details=True)
