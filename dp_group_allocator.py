@@ -99,6 +99,18 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="한 조에 함께 배치될 수 있는 연임자 최대 인원 (default: 1)",
     )
+    parser.add_argument(
+        "--same-group",
+        nargs="+",
+        action="append",
+        help="같은 조에 배치해야 하는 인원 그룹. 예: --same-group 염규민 문형준",
+    )
+    parser.add_argument(
+        "--balance-weight",
+        type=float,
+        default=0.3,
+        help="비용 분산 최소화 가중치 (0.0=총비용만, 1.0=분산만, 0.3=하이브리드 기본값)",
+    )
     return parser.parse_args()
 
 
@@ -230,6 +242,8 @@ def dp_min_overlap(
     branch_limit: int,
     genders: Sequence[str],
     veteran_flags: Sequence[bool],
+    same_groups: Optional[List[List[str]]] = None,
+    member_names: Optional[List[str]] = None,
 ) -> Tuple[int, List[Tuple[int, ...]]]:
     n = len(overlap)
     full_mask = (1 << n) - 1
@@ -295,7 +309,183 @@ def dp_min_overlap(
     total_cost, assignment = solve(0, 0)
     if math.isinf(total_cost):
         raise RuntimeError("유효한 조 편성 조합을 찾지 못했습니다. branch_limit를 늘리거나 설정을 조정하세요.")
+    
     return total_cost, list(assignment)
+
+
+def balance_costs(
+    assignment: Tuple[Tuple[int, ...], ...],
+    overlap: Sequence[Sequence[int]],
+    group_specs: Sequence[Dict],
+    genders: Sequence[str],
+    veteran_flags: Sequence[bool],
+    same_groups: Optional[List[List[str]]] = None,
+    member_names: Optional[List[str]] = None,
+    balance_weight: float = 0.3,
+    max_iterations: int = 50,
+) -> Tuple[Tuple[int, ...], ...]:
+    """하이브리드 방식: 비용 분산 최소화 + 총 비용 증가 최소화"""
+    assignment = list(list(team) for team in assignment)
+    n_groups = len(assignment)
+    
+    # same_groups 제약 적용: 같은 조에 있어야 하는 사람들
+    if same_groups and member_names:
+        name_to_idx = {name: i for i, name in enumerate(member_names)}
+        for group in same_groups:
+            if len(group) < 2:
+                continue
+            # 첫 번째 사람이 있는 조를 찾고, 나머지 사람들도 같은 조로 이동
+            first_name = group[0]
+            if first_name not in name_to_idx:
+                continue
+            first_idx = name_to_idx[first_name]
+            target_group_idx = None
+            for i, team in enumerate(assignment):
+                if first_idx in team:
+                    target_group_idx = i
+                    break
+            if target_group_idx is None:
+                continue
+            # 나머지 사람들도 같은 조로 이동
+            for name in group[1:]:
+                if name not in name_to_idx:
+                    continue
+                person_idx = name_to_idx[name]
+                # 현재 어느 조에 있는지 찾기
+                current_group_idx = None
+                for i, team in enumerate(assignment):
+                    if person_idx in team:
+                        current_group_idx = i
+                        break
+                if current_group_idx is not None and current_group_idx != target_group_idx:
+                    # 다른 조에 있으면 이동
+                    assignment[current_group_idx].remove(person_idx)
+                    assignment[target_group_idx].append(person_idx)
+    
+    def get_costs() -> List[int]:
+        return [team_cost(team, overlap) for team in assignment]
+    
+    def check_same_groups_constraint() -> bool:
+        """same_groups 제약이 만족되는지 확인"""
+        if not same_groups or not member_names:
+            return True
+        name_to_idx = {name: i for i, name in enumerate(member_names)}
+        for group in same_groups:
+            if len(group) < 2:
+                continue
+            indices = [name_to_idx.get(name) for name in group if name in name_to_idx]
+            if len(indices) < 2:
+                continue
+            # 모든 인덱스가 같은 조에 있는지 확인
+            group_indices = set()
+            for idx in indices:
+                for i, team in enumerate(assignment):
+                    if idx in team:
+                        group_indices.add(i)
+                        break
+            if len(group_indices) > 1:
+                return False
+        return True
+    
+    for _ in range(max_iterations):
+        costs = get_costs()
+        max_idx = max(range(n_groups), key=lambda i: costs[i])
+        min_idx = min(range(n_groups), key=lambda i: costs[i])
+        
+        if costs[max_idx] - costs[min_idx] <= 1:
+            break  # 비용이 이미 고르게 분배됨
+        
+        # 최대 비용 조와 최소 비용 조 간에 인원 교환 시도
+        max_team = assignment[max_idx]
+        min_team = assignment[min_idx]
+        
+        improved = False
+        for i, person_a in enumerate(max_team):
+            for j, person_b in enumerate(min_team):
+                # 스왑 가능 여부 확인
+                if person_a == person_b:
+                    continue
+                
+                # 스왑 후 제약 조건 확인
+                new_max_team = max_team[:i] + [person_b] + max_team[i+1:]
+                new_min_team = min_team[:j] + [person_a] + min_team[j+1:]
+                
+                # 제약 조건 검증
+                spec_max = group_specs[max_idx]
+                spec_min = group_specs[min_idx]
+                
+                if not validate_team(new_max_team, spec_max, genders, veteran_flags):
+                    continue
+                if not validate_team(new_min_team, spec_min, genders, veteran_flags):
+                    continue
+                
+                # same_groups 제약 확인
+                assignment[max_idx] = new_max_team
+                assignment[min_idx] = new_min_team
+                if not check_same_groups_constraint():
+                    # 제약 위반 시 원래대로 복구
+                    assignment[max_idx] = max_team
+                    assignment[min_idx] = min_team
+                    continue
+                
+                # 비용 개선 확인
+                old_max_cost = team_cost(max_team, overlap)
+                old_min_cost = team_cost(min_team, overlap)
+                new_max_cost = team_cost(new_max_team, overlap)
+                new_min_cost = team_cost(new_min_team, overlap)
+                
+                old_diff = old_max_cost - old_min_cost
+                new_diff = max(new_max_cost, new_min_cost) - min(new_max_cost, new_min_cost)
+                
+                # 총 비용 변화
+                old_total = old_max_cost + old_min_cost
+                new_total = new_max_cost + new_min_cost
+                cost_increase = new_total - old_total
+                
+                # 하이브리드 목적 함수: 분산 감소 - α × 총비용 증가
+                # balance_weight가 클수록 분산 감소를 더 중요시
+                improvement = (old_diff - new_diff) - balance_weight * cost_increase
+                
+                if improvement > 0:
+                    improved = True
+                    break
+                else:
+                    # 개선되지 않으면 원래대로 복구
+                    assignment[max_idx] = max_team
+                    assignment[min_idx] = min_team
+            
+            if improved:
+                break
+        
+        if not improved:
+            break
+    
+    return tuple(tuple(team) for team in assignment)
+
+
+def validate_team(
+    team: List[int],
+    spec: Dict,
+    genders: Sequence[str],
+    veteran_flags: Sequence[bool],
+) -> bool:
+    """팀이 제약 조건을 만족하는지 확인"""
+    required_idx = spec.get("required")
+    if required_idx is not None and required_idx not in team:
+        return False
+    
+    min_male = spec.get("min_male", 0)
+    max_male = spec.get("max_male", len(team))
+    male_count = sum(1 for idx in team if genders[idx] == "M")
+    if male_count < min_male or male_count > max_male:
+        return False
+    
+    max_veterans = spec.get("max_veterans", len(veteran_flags))
+    vet_count = sum(1 for idx in team if veteran_flags[idx])
+    if vet_count > max_veterans:
+        return False
+    
+    return True
 
 
 def summarize(
@@ -386,9 +576,27 @@ def main() -> None:
             }
         )
 
+    same_groups = args.same_group if args.same_group else None
     total_cost, assignment = dp_min_overlap(
-        group_specs, overlap, args.branch_limit, genders, veteran_flags
+        group_specs, overlap, args.branch_limit, genders, veteran_flags, same_groups, present_members
     )
+    
+    # 하이브리드 방식: 비용 분산 최소화 + 총 비용 증가 최소화
+    assignment = balance_costs(
+        tuple(tuple(team) for team in assignment),
+        overlap,
+        group_specs,
+        genders,
+        veteran_flags,
+        same_groups,
+        present_members,
+        args.balance_weight,
+    )
+    assignment = list(assignment)
+    
+    # 최종 총 비용 재계산
+    total_cost = sum(team_cost(team, overlap) for team in assignment)
+    
     summarize(assignment, present_members, overlap, genders)
 
     if args.output:
